@@ -63,7 +63,9 @@ class lazy_encode(object):
 def calc_difficulty(parent, timestamp):
     config = parent.config
     offset = parent.difficulty // config['BLOCK_DIFF_FACTOR']
-    if parent.number >= (config['HOMESTEAD_FORK_BLKNUM'] - 1):
+    if parent.number >= (config['METROPOLIS_FORK_BLKNUM'] - 1):
+        sign = max(len(parent.uncles) - ((timestamp - parent.timestamp) // config['METROPOLIS_DIFF_ADJUSTMENT_CUTOFF']), -99)
+    elif parent.number >= (config['HOMESTEAD_FORK_BLKNUM'] - 1):
         sign = max(1 - ((timestamp - parent.timestamp) // config['HOMESTEAD_DIFF_ADJUSTMENT_CUTOFF']), -99)
     else:
         sign = 1 if timestamp - parent.timestamp < config['DIFF_ADJUSTMENT_CUTOFF'] else -1
@@ -789,7 +791,10 @@ class Block(rlp.Serializable):
 
     def mk_transaction_receipt(self, tx):
         """Create a receipt for a transaction."""
-        return Receipt(self.state_root, self.gas_used, self.logs)
+        if self.number >= self.config["METROPOLIS_FORK_BLKNUM"]:
+            return Receipt('\x00' * 32, self.gas_used, self.logs)
+        else:
+            return Receipt(self.state_root, self.gas_used, self.logs)
 
     def add_transaction_to_list(self, tx):
         """Add a transaction to the transaction trie.
@@ -959,7 +964,7 @@ class Block(rlp.Serializable):
             for k in self.caches[CACHE_KEY]:
                 self.set_and_journal(CACHE_KEY, k, 0)
 
-    def get_storage_data(self, address, index):
+    def get_storage_bytes(self, address, index):
         """Get a specific item in the storage of an account.
 
         :param address: the address of the account (binary or hex string)
@@ -975,9 +980,16 @@ class Block(rlp.Serializable):
         key = utils.zpad(utils.coerce_to_bytes(index), 32)
         storage = self.get_storage(address).get(key)
         if storage:
-            return rlp.decode(storage, big_endian_int)
+            return rlp.decode(storage)
         else:
-            return 0
+            return ''
+
+    def get_storage_data(self, address, index):
+        bytez = self.get_storage_bytes(address, index)
+        if len(bytez) >= 32:
+            return big_endian_to_int(bytez[-32:])
+        else:
+            return big_endian_to_int(bytez)
 
     def set_storage_data(self, address, index, value):
         """Set a specific item in the storage of an account.
@@ -993,6 +1005,7 @@ class Block(rlp.Serializable):
         if CACHE_KEY not in self.caches:
             self.caches[CACHE_KEY] = {}
             self.set_and_journal('all', address, True)
+        assert isinstance(value, (str, bytes))
         self.set_and_journal(CACHE_KEY, index, value)
 
     def account_exists(self, address):
@@ -1097,9 +1110,9 @@ class Block(rlp.Serializable):
                 v2 = subcache.get(utils.big_endian_to_int(k), None)
                 hexkey = b'0x' + encode_hex(utils.zunpad(k))
                 if v2 is not None:
-                    if v2 != 0:
+                    if v2 != '':
                         med_dict['storage'][hexkey] = \
-                            b'0x' + encode_hex(utils.int_to_big_endian(v2))
+                            b'0x' + encode_hex(v2)
                 elif v is not None:
                     med_dict['storage'][hexkey] = b'0x' + encode_hex(rlp.decode(v))
 
@@ -1161,6 +1174,26 @@ class Block(rlp.Serializable):
         self.transaction_count = mysnapshot['txcount']
         self._get_transactions_cache = []
         self.ether_delta = mysnapshot['ether_delta']
+
+    def initialize(self, parent):
+        # DAO fork
+        if self.number == self.config["DAO_FORK_BLKNUM"]:
+            dao_main_addr = utils.normalize_address(self.config["DAO_MAIN_ADDR"])
+            for acct in map(utils.normalize_address, self.config["DAO_ADDRESS_LIST"]):
+                self.delta_balance(dao_main_addr, self.get_balance(addr))
+                self.set_balance(addr, 0)
+            self.set_code(dao_main_addr, self.config["DAO_NEWCODE"])
+        # Likely metropolis changes
+        if self.number == self.config["METROPOLIS_FORK_BLKNUM"]:
+            self.set_code(utils.normalize_address(self.config["METROPOLIS_STATEROOT_STORE"]), self.config["METROPOLIS_GETTER_CODE"])
+            self.set_code(utils.normalize_address(self.config["METROPOLIS_BLOCKHASH_STORE"]), self.config["METROPOLIS_GETTER_CODE"])
+        if self.number >= self.config["METROPOLIS_FORK_BLKNUM"]:
+            self.set_storage_data(utils.normalize_address(self.config["METROPOLIS_STATEROOT_STORE"]),
+                                  self.number % self.config["METROPOLIS_WRAPAROUND"],
+                                  parent.state_root)
+            self.set_storage_data(utils.normalize_address(self.config["METROPOLIS_BLOCKHASH_STORE"]),
+                                  self.number % self.config["METROPOLIS_WRAPAROUND"],
+                                  self.prevhash)
 
     def finalize(self):
         """Apply rewards and commit."""
