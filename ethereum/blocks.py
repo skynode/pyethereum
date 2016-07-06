@@ -332,7 +332,7 @@ class BlockHeader(rlp.Serializable):
         return isinstance(other, BlockHeader) and self.hash == other.hash
 
     def __hash__(self):
-        return utils.big_endian_to_int(self.hash)
+        return big_endian_to_int(self.hash)
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -1106,7 +1106,7 @@ class Block(rlp.Serializable):
                        for kk in list(subcache.keys())]
             for k in list(d.keys()) + subkeys:
                 v = d.get(k, None)
-                v2 = subcache.get(utils.big_endian_to_int(k), None)
+                v2 = subcache.get(big_endian_to_int(k), None)
                 hexkey = b'0x' + encode_hex(utils.zunpad(k))
                 if v2 is not None:
                     if v2 != 0:
@@ -1298,7 +1298,7 @@ class Block(rlp.Serializable):
         return isinstance(other, (Block, CachedBlock)) and self.hash == other.hash
 
     def __hash__(self):
-        return utils.big_endian_to_int(self.hash)
+        return big_endian_to_int(self.hash)
 
     def __ne__(self, other):
         return not self.__eq__(other)
@@ -1356,7 +1356,7 @@ class CachedBlock(Block):
         pass
 
     def __hash__(self):
-        return utils.big_endian_to_int(self.hash)
+        return big_endian_to_int(self.hash)
 
     @property
     def hash(self):
@@ -1444,8 +1444,8 @@ def genesis(env, **kwargs):
             block.set_nonce(addr, utils.parse_int_or_hex(data['nonce']))
         if 'storage' in data:
             for k, v in data['storage'].items():
-                block.set_storage_data(addr, utils.big_endian_to_int(decode_hex(k[2:])),
-                                       utils.big_endian_to_int(decode_hex(v[2:])))
+                block.set_storage_data(addr, big_endian_to_int(decode_hex(k[2:])),
+                                       big_endian_to_int(decode_hex(v[2:])))
     block.commit_state()
     block.state.db.commit()
     # genesis block has predefined state root (so no additional finalization
