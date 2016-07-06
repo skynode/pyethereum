@@ -989,7 +989,7 @@ class Block(rlp.Serializable):
         if len(bytez) >= 32:
             return big_endian_to_int(bytez[-32:])
         else:
-            return big_endian_to_int(bytez) * (1 << (8 * (32 - len(bytes))))
+            return big_endian_to_int(bytez) * (1 << (8 * (32 - len(bytez))))
 
     def set_storage_data(self, address, index, value):
         """Set a specific item in the storage of an account.
