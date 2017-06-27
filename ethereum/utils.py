@@ -1,9 +1,9 @@
 try:
     from Crypto.Hash import keccak
     sha3_256 = lambda x: keccak.new(digest_bits=256, data=x).digest()
-except:
+except ImportError:
     import sha3 as _sha3
-    sha3_256 = lambda x: _sha3.sha3_256(x).digest()
+    sha3_256 = lambda x: _sha3.keccak_256(x).digest()
 from bitcoin import privtopub, ecdsa_raw_sign, ecdsa_raw_recover, encode_pubkey
 import sys
 import rlp
@@ -11,10 +11,13 @@ from rlp.sedes import big_endian_int, BigEndianInt, Binary
 from rlp.utils import decode_hex, encode_hex, ascii_chr, str_to_bytes
 import random
 
+
 try:
-    from secp256k1 import PublicKey, ALL_FLAGS, PrivateKey
-except:
-    pass
+    import secp256k1
+except ImportError:
+    import warnings
+    warnings.warn('could not import secp256k1', ImportWarning)
+    secp256k1 = None
 
 big_endian_to_int = lambda x: big_endian_int.deserialize(str_to_bytes(x).lstrip(b'\x00'))
 int_to_big_endian = lambda x: big_endian_int.serialize(x)
@@ -23,6 +26,7 @@ int_to_big_endian = lambda x: big_endian_int.serialize(x)
 TT256 = 2 ** 256
 TT256M1 = 2 ** 256 - 1
 TT255 = 2 ** 255
+SECP256K1P = 2**256 - 4294968273
 
 if sys.version_info.major == 2:
     is_numeric = lambda x: isinstance(x, (int, long))
@@ -42,6 +46,12 @@ if sys.version_info.major == 2:
 
     def bytearray_to_bytestr(value):
         return bytes(''.join(chr(c) for c in value))
+
+    def encode_int32(v):
+        return zpad(int_to_big_endian(v), 32)
+
+    def bytes_to_int(value):
+        return big_endian_to_int(bytes(''.join(chr(c) for c in value)))
 
 else:
     is_numeric = lambda x: isinstance(x, int)
@@ -67,21 +77,33 @@ else:
     def bytearray_to_bytestr(value):
         return bytes(value)
 
+    def encode_int32(v):
+        return v.to_bytes(32, byteorder='big')
+
+    def bytes_to_int(value):
+        return int.from_bytes(value, byteorder='big')
+
 
 def ecrecover_to_pub(rawhash, v, r, s):
-    try:
-        pk = PublicKey(flags=ALL_FLAGS)
-        using_pk = 1
-        pk.public_key = pk.ecdsa_recover(
-            rawhash,
-            pk.ecdsa_recoverable_deserialize(
-                zpad(utils.bytearray_to_bytestr(int_to_32bytearray(r)), 32) + zpad(utils.bytearray_to_bytestr(int_to_32bytearray(s)), 32),
-                v - 27
-            ),
-            raw=True
-        )
-        pub = pk.serialize(compressed=False)[1:]
-    except:
+    if secp256k1:
+        # Legendre symbol check; the secp256k1 library does not seem to do this
+        pk = secp256k1.PublicKey(flags=secp256k1.ALL_FLAGS)
+        xc = r * r * r + 7
+        assert pow(xc, (SECP256K1P - 1) // 2, SECP256K1P) == 1
+        try:
+            pk.public_key = pk.ecdsa_recover(
+                rawhash,
+                pk.ecdsa_recoverable_deserialize(
+                    zpad(bytearray_to_bytestr(int_to_32bytearray(r)), 32) +
+                    zpad(bytearray_to_bytestr(int_to_32bytearray(s)), 32),
+                    v - 27
+                ),
+                raw=True
+            )
+            pub = pk.serialize(compressed=False)[1:]
+        except:
+            pub = b"\x00" * 64
+    else:
         recovered_addr = ecdsa_raw_recover(rawhash, (v, r, s))
         pub = encode_pubkey(recovered_addr, 'bin_electrum')
     assert len(pub) == 64
@@ -89,16 +111,16 @@ def ecrecover_to_pub(rawhash, v, r, s):
 
 
 def ecsign(rawhash, key):
-    try:
-        pk = PrivateKey(key, raw=True)
+    if secp256k1 and hasattr(secp256k1, 'PrivateKey'):
+        pk = secp256k1.PrivateKey(key, raw=True)
         signature = pk.ecdsa_recoverable_serialize(
             pk.ecdsa_sign_recoverable(rawhash, raw=True)
         )
-        signature = signature[0] + utils.bytearray_to_bytestr([signature[1]])
-        v = utils.safe_ord(signature[64]) + 27
+        signature = signature[0] + bytearray_to_bytestr([signature[1]])
+        v = safe_ord(signature[64]) + 27
         r = big_endian_to_int(signature[0:32])
         s = big_endian_to_int(signature[32:64])
-    except:
+    else:
         v, r, s = ecdsa_raw_sign(rawhash, key)
     return v, r, s
 
@@ -106,8 +128,10 @@ def ecsign(rawhash, key):
 def mk_contract_address(sender, nonce):
     return sha3(rlp.encode([normalize_address(sender), nonce]))[12:]
 
+
 def mk_metropolis_contract_address(sender, initcode):
     return sha3(normalize_address(sender) + initcode)[12:]
+
 
 def safe_ord(value):
     if isinstance(value, int):
@@ -151,37 +175,34 @@ def int_to_32bytearray(i):
         i >>= 8
     return o
 
-sha3_count = [0]
+# sha3_count = [0]
+
 
 def sha3(seed):
-    sha3_count[0] += 1
-    # print seed
     return sha3_256(to_string(seed))
 
-assert encode_hex(sha3(b'')) == b'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470'
+assert encode_hex(sha3(b'')) == 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470'
 
 
-def privtoaddr(x, extended=False):
+def privtoaddr(x):
     if len(x) > 32:
         x = decode_hex(x)
-    o = sha3(privtopub(x)[1:])[12:]
-    return add_checksum(o) if extended else o
+    return sha3(privtopub(x)[1:])[12:]
 
 
-def add_checksum(x):
-    if len(x) in (40, 48):
-        x = decode_hex(x)
-    if len(x) == 24:
-        return x
-    return x + sha3(x)[:4]
+def checksum_encode(addr): # Takes a 20-byte binary address as input
+    addr = normalize_address(addr)
+    o = ''
+    v = big_endian_to_int(sha3(encode_hex(addr)))
+    for i, c in enumerate(encode_hex(addr)):
+        if c in '0123456789':
+            o += c
+        else:
+            o += c.upper() if (v & (2**(255 - 4*i))) else c.lower()
+    return '0x'+o
 
-
-def check_and_strip_checksum(x):
-    if len(x) in (40, 48):
-        x = decode_hex(x)
-    assert len(x) == 24 and sha3(x[:20])[:4] == x[-4:]
-    return x[:20]
-
+def check_checksum(addr):
+    return checksum_encode(normalize_address(addr)) == addr
 
 def normalize_address(x, allow_blank=False):
     if is_numeric(x):
@@ -199,17 +220,48 @@ def normalize_address(x, allow_blank=False):
         raise Exception("Invalid address format: %r" % x)
     return x
 
+def normalize_key(key):
+    if is_numeric(key):
+        o = encode_int32(key)
+    elif len(key) == 32:
+        o = key
+    elif len(key) == 64:
+        o = decode_hex(key)
+    elif len(key) == 66 and key[:2] == '0x':
+        o = decode_hex(key[2:])
+    else:
+        raise Exception("Invalid key format: %r" % key)
+    if o == b'\x00' * 32:
+        raise Exception("Zero privkey invalid")
+    return o
 
 def zpad(x, l):
+    """ Left zero pad value `x` at least to length `l`.
+
+    >>> zpad('', 1)
+    '\x00'
+    >>> zpad('\xca\xfe', 4)
+    '\x00\x00\xca\xfe'
+    >>> zpad('\xff', 1)
+    '\xff'
+    >>> zpad('\xca\xfe', 2)
+    '\xca\xfe'
+    """
     return b'\x00' * max(0, l - len(x)) + x
 
+def rzpad(value, total_length):
+    """ Right zero pad value `x` at least to length `l`.
 
-def zunpad(x):
-    i = 0
-    while i < len(x) and (x[i] == 0 or x[i] == b'\x00'):
-        i += 1
-    return x[i:]
-
+    >>> zpad('', 1)
+    '\x00'
+    >>> zpad('\xca\xfe', 4)
+    '\xca\xfe\x00\x00'
+    >>> zpad('\xff', 1)
+    '\xff'
+    >>> zpad('\xca\xfe', 2)
+    '\xca\xfe'
+    """
+    return value + b'\x00' * max(0, total_length - len(value))
 
 def int_to_addr(x):
     o = [b''] * 20
@@ -282,21 +334,21 @@ def sha3rlp(x):
 
 
 def decode_bin(v):
-    '''decodes a bytearray from serialization'''
+    """decodes a bytearray from serialization"""
     if not is_string(v):
         raise Exception("Value must be binary, not RLP array")
     return v
 
 
 def decode_addr(v):
-    '''decodes an address from serialization'''
+    """decodes an address from serialization"""
     if len(v) not in [0, 20]:
         raise Exception("Serialized addresses must be empty or 20 bytes long!")
     return encode_hex(v)
 
 
 def decode_int(v):
-    '''decodes and integer from serialization'''
+    """decodes and integer from serialization"""
     if len(v) > 0 and (v[0] == b'\x00' or v[0] == 0):
         raise Exception("No leading zero bytes allowed for integers")
     return big_endian_to_int(v)
@@ -307,17 +359,17 @@ def decode_int256(v):
 
 
 def encode_bin(v):
-    '''encodes a bytearray into serialization'''
+    """encodes a bytearray into serialization"""
     return v
 
 
 def encode_root(v):
-    '''encodes a trie root into serialization'''
+    """encodes a trie root into serialization"""
     return v
 
 
 def encode_int(v):
-    '''encodes an integer into serialization'''
+    """encodes an integer into serialization"""
     if not is_numeric(v) or v < 0 or v >= TT256:
         raise Exception("Integer invalid or out of range: %r" % v)
     return int_to_big_endian(v)
@@ -359,7 +411,7 @@ encoders = {
 
 # Encoding to printable format
 printers = {
-    "bin": lambda v: b'0x' + encode_hex(v),
+    "bin": lambda v: '0x' + encode_hex(v),
     "addr": lambda v: v,
     "int": lambda v: to_string(v),
     "trie_root": lambda v: encode_hex(v),
@@ -369,7 +421,7 @@ printers = {
 # Decoding from printable format
 scanners = {
     "bin": scan_bin,
-    "addr": lambda x: x[2:] if x[:2] == b'0x' else x,
+    "addr": lambda x: x[2:] if x[:2] in (b'0x', '0x') else x,
     "int": scan_int,
     "trie_root": lambda x: scan_bin,
     "int256b": lambda x: big_endian_to_int(decode_hex(x))
@@ -378,15 +430,23 @@ scanners = {
 
 def int_to_hex(x):
     o = encode_hex(encode_int(x))
-    return b'0x' + (o[1:] if (len(o) > 0 and o[0] == b'0') else o)
+    return '0x' + (o[1:] if (len(o) > 0 and o[0] == b'0') else o)
 
 
 def remove_0x_head(s):
-    return s[2:] if s[:2] == b'0x' else s
+    return s[2:] if s[:2] in (b'0x', '0x') else s
+
+
+def parse_as_bin(s):
+    return decode_hex(s[2:] if s[:2] == '0x' else s)
+
+
+def parse_as_int(s):
+    return s if is_numeric(s) else int('0' + s[2:], 16) if s[:2] == '0x' else int(s)
 
 
 def print_func_call(ignore_first_arg=False, max_call_number=100):
-    ''' utility function to facilitate debug, it will print input args before
+    """ utility function to facilitate debug, it will print input args before
     function call, and print return value after function call
 
     usage:
@@ -397,7 +457,7 @@ def print_func_call(ignore_first_arg=False, max_call_number=100):
 
     :param ignore_first_arg: whether print the first arg or not.
     useful when ignore the `self` parameter of an object method call
-    '''
+    """
     from functools import wraps
 
     def display(x):
@@ -449,12 +509,18 @@ class Denoms():
     def __init__(self):
         self.wei = 1
         self.babbage = 10 ** 3
+        self.ada = 10 ** 3
+        self.kwei = 10 ** 6
         self.lovelace = 10 ** 6
+        self.mwei = 10 ** 6
         self.shannon = 10 ** 9
+        self.gwei = 10 ** 9
         self.szabo = 10 ** 12
         self.finney = 10 ** 15
+        self.mether = 10 ** 15
         self.ether = 10 ** 18
-        self.turing = 2 ** 256
+        self.turing = 2 ** 256 - 1
+
 
 denoms = Denoms()
 
@@ -465,6 +531,17 @@ int32 = BigEndianInt(32)
 int256 = BigEndianInt(256)
 hash32 = Binary.fixed_length(32)
 trie_root = Binary.fixed_length(32, allow_empty=True)
+
+
+class bcolors:
+    HEADER = '\033[95m'
+    OKBLUE = '\033[94m'
+    OKGREEN = '\033[92m'
+    WARNING = '\033[91m'
+    FAIL = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
 
 
 def DEBUG(msg, *args, **kwargs):

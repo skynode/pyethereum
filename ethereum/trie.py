@@ -5,7 +5,8 @@ from ethereum import utils
 from ethereum.utils import to_string
 from ethereum.abi import is_string
 import copy
-from rlp.utils import decode_hex, encode_hex, ascii_chr, str_to_bytes
+from rlp.utils import decode_hex, ascii_chr, str_to_bytes
+from ethereum.utils import encode_hex
 from ethereum.fast_rlp import encode_optimized
 rlp_encode = encode_optimized
 
@@ -13,6 +14,8 @@ bin_to_nibbles_cache = {}
 
 hti = {}
 for i, c in enumerate(b'0123456789abcdef'):
+    hti[c] = i
+for i, c in enumerate('0123456789abcdef'):
     hti[c] = i
 
 
@@ -45,61 +48,6 @@ def nibbles_to_bin(nibbles):
 
 
 NIBBLE_TERMINATOR = 16
-RECORDING = 1
-NONE = 0
-VERIFYING = -1
-
-proving = False
-
-
-class ProofConstructor():
-
-    def __init__(self):
-        self.mode = []
-        self.nodes = []
-        self.exempt = []
-
-    def push(self, mode, nodes=[]):
-        global proving
-        proving = True
-        self.mode.append(mode)
-        self.exempt.append(set())
-        if mode == VERIFYING:
-            self.nodes.append(set([rlp_encode(x) for x in nodes]))
-        else:
-            self.nodes.append(set())
-
-    def pop(self):
-        global proving
-        self.mode.pop()
-        self.nodes.pop()
-        self.exempt.pop()
-        if not self.mode:
-            proving = False
-
-    def get_nodelist(self):
-        return list(map(rlp.decode, list(self.nodes[-1])))
-
-    def get_nodes(self):
-        return self.nodes[-1]
-
-    def add_node(self, node):
-        node = rlp_encode(node)
-        if node not in self.exempt[-1]:
-            self.nodes[-1].add(node)
-
-    def add_exempt(self, node):
-        self.exempt[-1].add(rlp_encode(node))
-
-    def get_mode(self):
-        return self.mode[-1]
-
-proof = ProofConstructor()
-
-
-class InvalidSPVProof(Exception):
-    pass
-
 
 def with_terminator(nibbles):
     nibbles = nibbles[:]
@@ -164,9 +112,9 @@ def unpack_to_nibbles(bindata):
 
 
 def starts_with(full, part):
-    ''' test whether the items in the part is
+    """ test whether the items in the part is
     the leading items of the full
-    '''
+    """
     if len(full) < len(part):
         return False
     return full[:len(part)] == part
@@ -188,30 +136,25 @@ BLANK_NODE = b''
 BLANK_ROOT = utils.sha3rlp(b'')
 
 
-def transient_trie_exception(*args):
-    raise Exception("Transient trie")
-
 
 class Trie(object):
 
-    def __init__(self, db, root_hash=BLANK_ROOT, transient=False):
-        '''it also present a dictionary like interface
+    def __init__(self, db, root_hash=BLANK_ROOT):
+        """it also present a dictionary like interface
 
         :param db key value database
         :root: blank or trie node in form of [key, value] or [v0,v1..v15,v]
-        '''
+        """
         self.db = db  # Pass in a database object directly
-        self.transient = transient
-        if self.transient:
-            self.update = self.get = self.delete = transient_trie_exception
         self.set_root_hash(root_hash)
+        self.deletes = []
 
     # def __init__(self, dbfile, root_hash=BLANK_ROOT):
-    #     '''it also present a dictionary like interface
+    #     """it also present a dictionary like interface
 
     #     :param dbfile: key value database
     #     :root: blank or trie node in form of [key, value] or [v0,v1..v15,v]
-    #     '''
+    #     """
     #     if isinstance(dbfile, str):
     #         dbfile = os.path.abspath(dbfile)
     #         self.db = DB(dbfile)
@@ -219,45 +162,20 @@ class Trie(object):
     # self.db = dbfile  # Pass in a database object directly
     #     self.set_root_hash(root_hash)
 
-    # For SPV proof production/verification purposes
-    def spv_grabbing(self, node):
-        global proving
-        if not proving:
-            pass
-        elif proof.get_mode() == RECORDING:
-            proof.add_node(copy.copy(node))
-            # print('recording %s' % encode_hex(utils.sha3(rlp_encode(node))))
-        elif proof.get_mode() == VERIFYING:
-            # print('verifying %s' % encode_hex(utils.sha3(rlp_encode(node))))
-            if rlp_encode(node) not in proof.get_nodes():
-                raise InvalidSPVProof("Proof invalid!")
-
-    def spv_storing(self, node):
-        global proving
-        if not proving:
-            pass
-        elif proof.get_mode() == RECORDING:
-            proof.add_exempt(copy.copy(node))
-        elif proof.get_mode() == VERIFYING:
-            proof.add_node(copy.copy(node))
-
     @property
     def root_hash(self):
-        '''always empty or a 32 bytes string
-        '''
-        return self.get_root_hash()
+        """always empty or a 32 bytes string
+        """
+        return self._root_hash
 
     def get_root_hash(self):
-        if self.transient:
-            return self.transient_root_hash
-        if self.root_node == BLANK_NODE:
-            return BLANK_ROOT
-        assert isinstance(self.root_node, list)
+        return self._root_hash
+
+    def _update_root_hash(self):
         val = rlp_encode(self.root_node)
         key = utils.sha3(val)
-        self.db.put(key, val)
-        self.spv_grabbing(self.root_node)
-        return key
+        self.db.put(key, str_to_bytes(val))
+        self._root_hash = key
 
     @root_hash.setter
     def root_hash(self, value):
@@ -266,20 +184,20 @@ class Trie(object):
     def set_root_hash(self, root_hash):
         assert is_string(root_hash)
         assert len(root_hash) in [0, 32]
-        if self.transient:
-            self.transient_root_hash = root_hash
-            return
         if root_hash == BLANK_ROOT:
             self.root_node = BLANK_NODE
+            self._root_hash = BLANK_ROOT
             return
         self.root_node = self._decode_to_node(root_hash)
+        self._root_hash = root_hash
 
     def clear(self):
-        ''' clear all tree data
-        '''
+        """ clear all tree data
+        """
         self._delete_child_storage(self.root_node)
         self._delete_node_storage(self.root_node)
         self.root_node = BLANK_NODE
+        self._root_hash = BLANK_ROOT
 
     def _delete_child_storage(self, node):
         node_type = self._get_node_type(node)
@@ -289,17 +207,17 @@ class Trie(object):
         elif node_type == NODE_TYPE_EXTENSION:
             self._delete_child_storage(self._decode_to_node(node[1]))
 
-    def _encode_node(self, node):
+    def _encode_node(self, node, put_in_db=True):
         if node == BLANK_NODE:
             return BLANK_NODE
-        assert isinstance(node, list)
+        # assert isinstance(node, list)
         rlpnode = rlp_encode(node)
         if len(rlpnode) < 32:
             return node
 
         hashkey = utils.sha3(rlpnode)
-        self.db.put(hashkey, rlpnode)
-        self.spv_storing(node)
+        if put_in_db:
+            self.db.put(hashkey, str_to_bytes(rlpnode))
         return hashkey
 
     def _decode_to_node(self, encoded):
@@ -308,15 +226,14 @@ class Trie(object):
         if isinstance(encoded, list):
             return encoded
         o = rlp.decode(self.db.get(encoded))
-        self.spv_grabbing(o)
         return o
 
     def _get_node_type(self, node):
-        ''' get node type and content
+        """ get node type and content
 
         :param node: node in form of list, or BLANK_NODE
         :return: node type
-        '''
+        """
         if node == BLANK_NODE:
             return NODE_TYPE_BLANK
 
@@ -550,8 +467,8 @@ class Trie(object):
         return t1, t2
 
     def _merge(self, node1, node2):
-        assert isinstance(node1, list) or not node1
-        assert isinstance(node2, list) or not node2
+        # assert isinstance(node1, list) or not node1
+        # assert isinstance(node2, list) or not node2
         node_type1 = self._get_node_type(node1)
         node_type2 = self._get_node_type(node2)
         if not node1:
@@ -677,13 +594,13 @@ class Trie(object):
         return nibbles_to_bin(without_terminator(o)) if o else None
 
     def _delete_node_storage(self, node):
-        '''delete storage
+        """delete storage
         :param node: node in form of list, or BLANK_NODE
-        '''
+        """
         if node == BLANK_NODE:
             return
-        assert isinstance(node, list)
-        encoded = self._encode_node(node)
+        # assert isinstance(node, list)
+        encoded = self._encode_node(node, put_in_db=False)
         if len(encoded) < 32:
             return
         """
@@ -691,7 +608,8 @@ class Trie(object):
         in the current trie implementation two nodes can share identical subtrees
         thus we can not safely delete nodes for now
         """
-        # self.db.delete(encoded) # FIXME
+        self.deletes.append(encoded)
+        # print('del', encoded, self.db.get_refcount(encoded))
 
     def _delete(self, node, key):
         """ update item inside a node
@@ -716,8 +634,8 @@ class Trie(object):
             return self._delete_kv_node(node, key)
 
     def _normalize_branch_node(self, node):
-        '''node should have only one item changed
-        '''
+        """node should have only one item changed
+        """
         not_blank_items_count = sum(1 for x in range(17) if node[x])
         assert not_blank_items_count >= 1
 
@@ -796,7 +714,7 @@ class Trie(object):
         if new_sub_node == BLANK_NODE:
             return BLANK_NODE
 
-        assert isinstance(new_sub_node, list)
+        # assert isinstance(new_sub_node, list)
 
         # new sub node not blank, not value and has changed
         new_sub_node_type = self._get_node_type(new_sub_node)
@@ -814,9 +732,9 @@ class Trie(object):
         assert False
 
     def delete(self, key):
-        '''
+        """
         :param key: a string with length of [0, 32]
-        '''
+        """
         if not is_string(key):
             raise Exception("Key must be string")
 
@@ -826,13 +744,13 @@ class Trie(object):
         self.root_node = self._delete_and_delete_storage(
             self.root_node,
             bin_to_nibbles(to_string(key)))
-        self.get_root_hash()
+        self._update_root_hash()
 
     def _get_size(self, node):
-        '''Get counts of (key, value) stored in this and the descendant nodes
+        """Get counts of (key, value) stored in this and the descendant nodes
 
         :param node: node in form of list, or BLANK_NODE
-        '''
+        """
         if node == BLANK_NODE:
             return 0
 
@@ -851,12 +769,12 @@ class Trie(object):
             return sum(sizes)
 
     def _iter_branch(self, node):
-        '''yield (key, value) stored in this and the descendant nodes
+        """yield (key, value) stored in this and the descendant nodes
         :param node: node in form of list, or BLANK_NODE
 
         .. note::
             Here key is in full form, rather than key of the individual node
-        '''
+        """
         if node == BLANK_NODE:
             raise StopIteration
 
@@ -894,7 +812,7 @@ class Trie(object):
             yield key, value
 
     def _to_dict(self, node):
-        '''convert (key, value) stored in this and the descendant nodes
+        """convert (key, value) stored in this and the descendant nodes
         to dict items.
 
         :param node: node in form of list, or BLANK_NODE
@@ -902,7 +820,7 @@ class Trie(object):
         .. note::
 
             Here key is in full form, rather than key of the individual node
-        '''
+        """
         if node == BLANK_NODE:
             return {}
 
@@ -970,10 +888,10 @@ class Trie(object):
         return self.get(key) != BLANK_NODE
 
     def update(self, key, value):
-        '''
+        """
         :param key: a string
         :value: a string
-        '''
+        """
         if not is_string(key):
             raise Exception("Key must be string")
 
@@ -989,38 +907,12 @@ class Trie(object):
             self.root_node,
             bin_to_nibbles(to_string(key)),
             to_string(value))
-        self.get_root_hash()
+        self._update_root_hash()
 
     def root_hash_valid(self):
         if self.root_hash == BLANK_ROOT:
             return True
         return self.root_hash in self.db
-
-    def produce_spv_proof(self, key):
-        proof.push(RECORDING)
-        self.get(key)
-        o = proof.get_nodelist()
-        proof.pop()
-        return o
-
-
-def verify_spv_proof(root, key, proof):
-    proof.push(VERIFYING, proof)
-    t = Trie(db.EphemDB())
-
-    for i, node in enumerate(proof):
-        R = rlp_encode(node)
-        H = utils.sha3(R)
-        t.db.put(H, R)
-    try:
-        t.root_hash = root
-        t.get(key)
-        proof.pop()
-        return True
-    except Exception as e:
-        print(e)
-        proof.pop()
-        return False
 
 
 if __name__ == "__main__":

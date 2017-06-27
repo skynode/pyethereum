@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 # ############# version ##################
-from pkg_resources import get_distribution, DistributionNotFound
+try:
+    from pkg_resources import get_distribution, DistributionNotFound
+except:
+    DistributionNotFound = Exception
 import os.path
 import subprocess
 import re
@@ -31,7 +34,7 @@ if not __version__:
         match = GIT_DESCRIBE_RE.match(rev)
         if match:
             __version__ = "{}+git-{}".format(match.group("version"), match.group("git"))
-    except:
+    except:  # FIXME!
         pass
 
 if not __version__:
@@ -39,7 +42,7 @@ if not __version__:
 
 # ########### endversion ##################
 
-'''from ethereum import utils
+"""from ethereum import utils
 from ethereum import trie
 from ethereum import securetrie
 from ethereum import blocks
@@ -48,4 +51,4 @@ from ethereum import processblock
 from ethereum import tester
 from ethereum import abi
 from ethereum import keys
-from ethereum import ethash'''
+from ethereum import ethash"""

@@ -1,9 +1,10 @@
-from ethereum import tester, blocks
 import ethereum.utils as utils
 import rlp
-import ethereum.testutils as testutils
-from ethereum.testutils import fixture_to_bytes
+import ethereum.tools.testutils as testutils
 import ethereum.config as config
+from ethereum.state import State
+from ethereum.common import calc_difficulty
+from ethereum.block import Block, BlockHeader
 import sys
 import os
 import json
@@ -16,7 +17,6 @@ logger = get_logger()
 
 
 def test_difficulty(filename, testname, testdata):
-    testdata = fixture_to_bytes(testdata)
 
     parent_timestamp=int(testdata["parentTimestamp"], 10 if testdata["parentTimestamp"].isdigit() else 16)
     parent_difficulty=int(testdata["parentDifficulty"], 10 if testdata["parentDifficulty"].isdigit() else 16)
@@ -25,24 +25,28 @@ def test_difficulty(filename, testname, testdata):
     reference_dif = int(testdata["currentDifficulty"], 10 if testdata["currentDifficulty"].isdigit() else 16)
 
 
-    env = tester.state().env
+    env = config.Env()
     if 'Homestead' in filename:
         env.config['HOMESTEAD_FORK_BLKNUM'] = 0
-    if 'difficultyMorden' in filename:
+    elif 'difficultyFrontier' in filename:
+        env.config['HOMESTEAD_FORK_BLKNUM'] = 2**99
+    elif 'difficultyMorden' in filename:
         env.config['HOMESTEAD_FORK_BLKNUM'] = 494000
+    elif 'difficultyRopsten' in filename:
+        env.config['HOMESTEAD_FORK_BLKNUM'] = 0
+    else:
+        env.config['HOMESTEAD_FORK_BLKNUM'] = 1150000
+    # env.config['EXPDIFF_FREE_PERIODS'] = 2**98
 
-    parent_bh = blocks.BlockHeader(timestamp=parent_timestamp,
-                             difficulty=parent_difficulty,
-                             number=parent_blk_number)
-    block = blocks.Block(parent_bh, [], env=env,
-                      making=True)
+    parent = Block(BlockHeader(timestamp=parent_timestamp,
+                               difficulty=parent_difficulty,
+                               number=parent_blk_number))
 
-
-    calculated_dif = blocks.calc_difficulty(block, cur_blk_timestamp)
+    calculated_dif = calc_difficulty(parent, cur_blk_timestamp, config=env.config)
 
     print(calculated_dif)
     print(reference_dif)
-    assert calculated_dif == reference_dif
+    assert calculated_dif == reference_dif, (parent.header.difficulty, reference_dif, calculated_dif, parent.header.number, cur_blk_timestamp - parent_timestamp)
 
 
 def not_a_difficulty_test(filename, testname, testdata):

@@ -1,14 +1,33 @@
-# -*- coding: utf8 -*-
+# -*- coding: utf-8 -*-
+from __future__ import print_function
+
 import ast
 import re
 import warnings
 
 import yaml  # use yaml instead of json to get non unicode (works with ascii only data)
-from rlp.utils import decode_hex, encode_hex
+from rlp.utils import decode_hex
+from ethereum.utils import encode_hex
 
 from ethereum import utils
-from ethereum.utils import encode_int, zpad, big_endian_to_int, is_numeric, is_string, ceil32
+from ethereum.utils import (
+    big_endian_to_int, ceil32, int_to_big_endian, encode_int, is_numeric, is_string,
+    rzpad, zpad, str_to_bytes
+)
 from ethereum.utils import TT256, TT255
+
+# The number of bytes is encoded as a uint256
+# Type used to encode a string/bytes length
+INT256 = 'uint', '256', []
+lentyp = INT256  # pylint: disable=invalid-name
+
+
+class EncodingError(Exception):
+    pass
+
+
+class ValueOutOfBounds(EncodingError):
+    pass
 
 
 def json_decode(data):
@@ -26,20 +45,40 @@ def split32(data):
     return all_pieces
 
 
-def _canonical_name(name):
-    """ Replace aliases to the corresponding type. """
-
-    if name.startswith('int['):
-        return 'uint256' + name[3:]
+def _canonical_type(name):  # pylint: disable=too-many-return-statements
+    """ Replace aliases to the corresponding type to compute the ids. """
 
     if name == 'int':
+        return 'int256'
+
+    if name == 'uint':
         return 'uint256'
 
-    if name.startswith('real['):
-        return 'real128x128' + name[4:]
+    if name == 'fixed':
+        return 'fixed128x128'
 
-    if name == 'real':
-        return 'real128x128'
+    if name == 'ufixed':
+        return 'ufixed128x128'
+
+    if name.startswith('int['):
+        return 'int256' + name[3:]
+
+    if name.startswith('uint['):
+        return 'uint256' + name[4:]
+
+    if name.startswith('fixed['):
+        return 'fixed128x128' + name[5:]
+
+    if name.startswith('ufixed['):
+        return 'ufixed128x128' + name[6:]
+
+    return name
+
+
+def normalize_name(name):
+    """ Return normalized event/function name. """
+    if '(' in name:
+        return name[:name.find('(')]
 
     return name
 
@@ -55,7 +94,7 @@ def method_id(name, encode_types):
     big-endian) of the Keccak (SHA-3) hash of the signature of the function.
     """
     function_types = [
-        _canonical_name(type_)
+        _canonical_type(type_)
         for type_ in encode_types
     ]
 
@@ -83,7 +122,7 @@ def event_id(name, encode_types):
     """
 
     event_types = [
-        _canonical_name(type_)
+        _canonical_type(type_)
         for type_ in encode_types
     ]
 
@@ -95,12 +134,271 @@ def event_id(name, encode_types):
     return big_endian_to_int(utils.sha3(event_signature))
 
 
-def _normalize_name(name):
-    """ Return normalized event/function name. """
-    if '(' in name:
-        return name[:name.find('(')]
+def decint(n, signed=False):  # pylint: disable=invalid-name,too-many-branches
+    """ Decode an unsigned/signed integer. """
 
-    return name
+    if isinstance(n, str):
+        n = utils.to_string(n)
+
+    if n is True:
+        return 1
+
+    if n is False:
+        return 0
+
+    if n is None:
+        return 0
+
+    if is_numeric(n):
+        if signed:
+            if not -TT255 <= n <= TT255 - 1:
+                raise EncodingError('Number out of range: %r' % n)
+        else:
+            if not 0 <= n <= TT256 - 1:
+                raise EncodingError('Number out of range: %r' % n)
+
+        return n
+
+    if is_string(n):
+        if len(n) > 32:
+            raise EncodingError('String too long: %r' % n)
+
+        if len(n) == 40:
+            int_bigendian = decode_hex(n)
+        else:
+            int_bigendian = n  # pylint: disable=redefined-variable-type
+
+        result = big_endian_to_int(int_bigendian)
+        if signed:
+            if result >= TT255:
+                result -= TT256
+
+            if not -TT255 <= result <= TT255 - 1:
+                raise EncodingError('Number out of range: %r' % n)
+        else:
+            if not 0 <= result <= TT256 - 1:
+                raise EncodingError('Number out of range: %r' % n)
+
+        return result
+
+    raise EncodingError('Cannot decode integer: %r' % n)
+
+
+def encode_single(typ, arg):  # pylint: disable=too-many-return-statements,too-many-branches,too-many-statements,too-many-locals
+    """ Encode `arg` as `typ`.
+
+    `arg` will be encoded in a best effort manner, were necessary the function
+    will try to correctly define the underlying binary representation (ie.
+    decoding a hex-encoded address/hash).
+
+    Args:
+        typ (Tuple[(str, int, list)]): A 3-tuple defining the `arg` type.
+
+            The first element defines the type name.
+            The second element defines the type length in bits.
+            The third element defines if it's an array type.
+
+            Together the first and second defines the elementary type, the third
+            element must be present but is ignored.
+
+            Valid type names are:
+                - uint
+                - int
+                - bool
+                - ufixed
+                - fixed
+                - string
+                - bytes
+                - hash
+                - address
+
+        arg (object): The object to be encoded, it must be a python object
+            compatible with the `typ`.
+
+    Raises:
+        ValueError: when an invalid `typ` is supplied.
+        ValueOutOfBounds: when `arg` cannot be encoded as `typ` because of the
+            binary contraints.
+
+    Note:
+        This function don't work with array types, for that use the `enc`
+        function.
+    """
+    base, sub, _ = typ
+
+    if base == 'uint':
+        sub = int(sub)
+
+        if not (0 < sub <= 256 and sub % 8 == 0):
+            raise ValueError('invalid unsigned integer bit length {}'.format(sub))
+
+        try:
+            i = decint(arg, signed=False)
+        except EncodingError:
+            # arg is larger than 2**256
+            raise ValueOutOfBounds(repr(arg))
+
+        if not 0 <= i < 2 ** sub:
+            raise ValueOutOfBounds(repr(arg))
+
+        value_encoded = int_to_big_endian(i)
+        return zpad(value_encoded, 32)
+
+    if base == 'int':
+        sub = int(sub)
+        bits = sub - 1
+
+        if not (0 < sub <= 256 and sub % 8 == 0):
+            raise ValueError('invalid integer bit length {}'.format(sub))
+
+        try:
+            i = decint(arg, signed=True)
+        except EncodingError:
+            # arg is larger than 2**255
+            raise ValueOutOfBounds(repr(arg))
+
+        if not -2 ** bits <= i < 2 ** bits:
+            raise ValueOutOfBounds(repr(arg))
+
+        value = i % 2 ** 256  # convert negative to "equivalent" positive
+        value_encoded = int_to_big_endian(value)
+        return zpad(value_encoded, 32)
+
+    if base == 'bool':
+        if arg is True:
+            value_encoded = int_to_big_endian(1)
+        elif arg is False:
+            value_encoded = int_to_big_endian(0)
+        else:
+            raise ValueError('%r is not bool' % arg)
+
+        return zpad(value_encoded, 32)
+
+    if base == 'ufixed':
+        sub = str(sub)  # pylint: disable=redefined-variable-type
+
+        high_str, low_str = sub.split('x')
+        high = int(high_str)
+        low = int(low_str)
+
+        if not (0 < high + low <= 256 and high % 8 == 0 and low % 8 == 0):
+            raise ValueError('invalid unsigned fixed length {}'.format(sub))
+
+        if not 0 <= arg < 2 ** high:
+            raise ValueOutOfBounds(repr(arg))
+
+        float_point = arg * 2 ** low
+        fixed_point = int(float_point)
+        return zpad(int_to_big_endian(fixed_point), 32)
+
+    if base == 'fixed':
+        sub = str(sub)  # pylint: disable=redefined-variable-type
+
+        high_str, low_str = sub.split('x')
+        high = int(high_str)
+        low = int(low_str)
+        bits = high - 1
+
+        if not (0 < high + low <= 256 and high % 8 == 0 and low % 8 == 0):
+            raise ValueError('invalid unsigned fixed length {}'.format(sub))
+
+        if not -2 ** bits <= arg < 2 ** bits:
+            raise ValueOutOfBounds(repr(arg))
+
+        float_point = arg * 2 ** low
+        fixed_point = int(float_point)
+        value = fixed_point % 2 ** 256
+        return zpad(int_to_big_endian(value), 32)
+
+    # Decimals
+    if base == 'decimal':
+        val_to_encode = int(arg * 10**int(sub))
+        return zpad(encode_int(val_to_encode % 2**256), 32)
+
+    if base == 'string':
+        if isinstance(arg, utils.unicode):
+            arg = arg.encode('utf8')
+        else:
+            try:
+                arg.decode('utf8')
+            except UnicodeDecodeError:
+                raise ValueError('string must be utf8 encoded')
+
+        if len(sub):  # fixed length
+            if not 0 <= len(arg) <= int(sub):
+                raise ValueError('invalid string length {}'.format(sub))
+
+            if not 0 <= int(sub) <= 32:
+                raise ValueError('invalid string length {}'.format(sub))
+
+            return rzpad(arg, 32)
+
+        if not 0 <= len(arg) < TT256:
+            raise Exception('Integer invalid or out of range: %r' % arg)
+
+        length_encoded = zpad(int_to_big_endian(len(arg)), 32)
+        value_encoded = rzpad(arg, utils.ceil32(len(arg)))
+
+        return length_encoded + value_encoded
+
+    if base == 'bytes':
+        if not is_string(arg):
+            if isinstance(arg, str):
+                arg = bytes(arg, 'utf8')
+            else:
+                raise EncodingError('Expecting string: %r' % arg)
+
+        arg = utils.to_string(arg)  # py2: force unicode into str
+
+        if len(sub):  # fixed length
+            if not 0 <= len(arg) <= int(sub):
+                raise ValueError('string must be utf8 encoded')
+
+            if not 0 <= int(sub) <= 32:
+                raise ValueError('string must be utf8 encoded')
+
+            return rzpad(arg, 32)
+
+        if not 0 <= len(arg) < TT256:
+            raise Exception('Integer invalid or out of range: %r' % arg)
+
+        length_encoded = zpad(int_to_big_endian(len(arg)), 32)
+        value_encoded = rzpad(arg, utils.ceil32(len(arg)))
+
+        return length_encoded + value_encoded
+
+    if base == 'hash':
+        if not (int(sub) and int(sub) <= 32):
+            raise EncodingError('too long: %r' % arg)
+
+        if is_numeric(arg):
+            return zpad(encode_int(arg), 32)
+
+        if len(arg) == int(sub):
+            return zpad(arg, 32)
+
+        if len(arg) == int(sub) * 2:
+            return zpad(decode_hex(arg), 32)
+
+        raise EncodingError('Could not parse hash: %r' % arg)
+
+    if base == 'address':
+        assert sub == ''
+
+        if is_numeric(arg):
+            return zpad(encode_int(arg), 32)
+
+        if len(arg) == 20:
+            return zpad(arg, 32)
+
+        if len(arg) == 40:
+            return zpad(decode_hex(arg), 32)
+
+        if len(arg) == 42 and arg[:2] == '0x':
+            return zpad(decode_hex(arg[2:]), 32)
+
+        raise EncodingError('Could not parse address: %r' % arg)
+    raise EncodingError('Unhandled type: %r %r' % (base, sub))
 
 
 class ContractTranslator(object):
@@ -109,40 +407,48 @@ class ContractTranslator(object):
         if is_string(contract_interface):
             contract_interface = json_decode(contract_interface)
 
+        self.fallback_data = None
         self.constructor_data = None
         self.function_data = {}
         self.event_data = {}
 
         for description in contract_interface:
-            encode_types = [
-                element['type']
-                for element in description['inputs']
-            ]
+            entry_type = description.get('type', 'function')
+            encode_types = []
+            signature = []
 
-            signature = [
-                (element['type'], element['name'])
-                for element in description['inputs']
-            ]
+            # If it's a function/constructor/event
+            if entry_type != 'fallback' and 'inputs' in description:
+                encode_types = [
+                    element['type']
+                    for element in description.get('inputs', [])
+                ]
 
-            # type can be omitted, defaulting to function
-            if description.get('type', 'function') == 'function':
-                normalized_name = _normalize_name(description['name'])
+                signature = [
+                    (element['type'], element['name'])
+                    for element in description.get('inputs', [])
+                ]
+
+            if entry_type == 'function':
+                normalized_name = normalize_name(description['name'])
+                prefix = method_id(normalized_name, encode_types)
 
                 decode_types = [
                     element['type']
-                    for element in description['outputs']
+                    for element in description.get('outputs', [])
                 ]
 
                 self.function_data[normalized_name] = {
-                    'prefix': method_id(normalized_name, encode_types),
+                    'prefix': prefix,
                     'encode_types': encode_types,
                     'decode_types': decode_types,
                     'is_constant': description.get('constant', False),
                     'signature': signature,
+                    'payable': description.get('payable', False),
                 }
 
-            elif description['type'] == 'event':
-                normalized_name = _normalize_name(description['name'])
+            elif entry_type == 'event':
+                normalized_name = normalize_name(description['name'])
 
                 indexed = [
                     element['indexed']
@@ -152,6 +458,7 @@ class ContractTranslator(object):
                     element['name']
                     for element in description['inputs']
                 ]
+                # event_id == topics[0]
                 self.event_data[event_id(normalized_name, encode_types)] = {
                     'types': encode_types,
                     'name': normalized_name,
@@ -160,7 +467,7 @@ class ContractTranslator(object):
                     'anonymous': description.get('anonymous', False),
                 }
 
-            elif description['type'] == 'constructor':
+            elif entry_type == 'constructor':
                 if self.constructor_data is not None:
                     raise ValueError('Only one constructor is supported.')
 
@@ -169,8 +476,21 @@ class ContractTranslator(object):
                     'signature': signature,
                 }
 
+            elif entry_type == 'fallback':
+                if self.fallback_data is not None:
+                    raise ValueError('Only one fallback function is supported.')
+                self.fallback_data = {'payable': description['payable']}
+
             else:
                 raise ValueError('Unknown type {}'.format(description['type']))
+
+    def encode(self, function_name, args):
+        warnings.warn('encode is deprecated, please use encode_function_call', DeprecationWarning)
+        return self.encode_function_call(function_name, args)
+
+    def decode(self, function_name, data):
+        warnings.warn('decode is deprecated, please use decode_function_result', DeprecationWarning)
+        return self.decode_function_result(function_name, data)
 
     def encode_function_call(self, function_name, args):
         """ Return the encoded function call.
@@ -196,9 +516,20 @@ class ContractTranslator(object):
 
         return function_selector + arguments
 
-    def encode(self, function_name, args):
-        warnings.warn('encode is deprecated, please use encode_function_call', DeprecationWarning)
-        return self.encode_function_call(function_name, args)
+    def decode_function_result(self, function_name, data):
+        """ Return the function call result decoded.
+
+        Args:
+            function_name (str): One of the existing functions described in the
+                contract interface.
+            data (bin): The encoded result from calling `function_name`.
+
+        Return:
+            List[object]: The values returned by the call to `function_name`.
+        """
+        description = self.function_data[function_name]
+        arguments = decode_abi(description['decode_types'], data)
+        return arguments
 
     def encode_constructor_arguments(self, args):
         """ Return the encoded constructor call. """
@@ -207,148 +538,79 @@ class ContractTranslator(object):
 
         return encode_abi(self.constructor_data['encode_types'], args)
 
-    def decode(self, function_name, data):
-        description = self.function_data[function_name]
-        return decode_abi(description['decode_types'], data)
+    def decode_event(self, log_topics, log_data):
+        """ Return a dictionary representation the log.
+
+        Note:
+            This function won't work with anonymous events.
+
+        Args:
+            log_topics (List[bin]): The log's indexed arguments.
+            log_data (bin): The encoded non-indexed arguments.
+        """
+        # https://github.com/ethereum/wiki/wiki/Ethereum-Contract-ABI#function-selector-and-argument-encoding
+
+        # topics[0]: keccak(EVENT_NAME+"("+EVENT_ARGS.map(canonical_type_of).join(",")+")")
+        # If the event is declared as anonymous the topics[0] is not generated;
+        if not len(log_topics) or log_topics[0] not in self.event_data:
+            raise ValueError('Unknown log type')
+
+        event_id_ = log_topics[0]
+
+        event = self.event_data[event_id_]
+
+        # data: abi_serialise(EVENT_NON_INDEXED_ARGS)
+        # EVENT_NON_INDEXED_ARGS is the series of EVENT_ARGS that are not
+        # indexed, abi_serialise is the ABI serialisation function used for
+        # returning a series of typed values from a function.
+        unindexed_types = [
+            type_
+            for type_, indexed in zip(event['types'], event['indexed'])
+            if not indexed
+        ]
+        unindexed_args = decode_abi(unindexed_types, log_data)
+
+        # topics[n]: EVENT_INDEXED_ARGS[n - 1]
+        # EVENT_INDEXED_ARGS is the series of EVENT_ARGS that are indexed
+        indexed_count = 1  # skip topics[0]
+
+        result = {}
+        for name, type_, indexed in zip(event['names'], event['types'], event['indexed']):
+            if indexed:
+                topic_bytes = utils.zpad(
+                    utils.encode_int(log_topics[indexed_count]),
+                    32,
+                )
+                indexed_count += 1
+                value = decode_single(process_type(type_), topic_bytes)
+            else:
+                value = unindexed_args.pop(0)
+
+            result[name] = value
+        result['_event_type'] = utils.to_string(event['name'])
+
+        return result
 
     def listen(self, log, noprint=True):
-        if not len(log.topics) or log.topics[0] not in self.event_data:
-            return
-        types = self.event_data[log.topics[0]]['types']
-        name = self.event_data[log.topics[0]]['name']
-        names = self.event_data[log.topics[0]]['names']
-        indexed = self.event_data[log.topics[0]]['indexed']
-        indexed_types = [types[i] for i in range(len(types))
-                         if indexed[i]]
-        unindexed_types = [types[i] for i in range(len(types))
-                           if not indexed[i]]
-        # print('listen', encode_hex(log.data), log.topics)
-        deserialized_args = decode_abi(unindexed_types, log.data)
-        o = {}
-        c1, c2 = 0, 0
-        for i in range(len(names)):
-            if indexed[i]:
-                topic_bytes = utils.zpad(utils.encode_int(log.topics[c1 + 1]), 32)
-                o[names[i]] = decode_single(process_type(indexed_types[c1]),
-                                            topic_bytes)
-                c1 += 1
-            else:
-                o[names[i]] = deserialized_args[c2]
-                c2 += 1
-        o["_event_type"] = utils.to_string(name)
+        """
+        Return a dictionary representation of the Log instance.
+
+        Note:
+            This function won't work with anonymous events.
+
+        Args:
+            log (processblock.Log): The Log instance that needs to be parsed.
+            noprint (bool): Flag to turn off priting of the decoded log instance.
+        """
+        try:
+            result = self.decode_event(log.topics, log.data)
+        except ValueError:
+            return  # api compatibility
+
         if not noprint:
-            print(o)
-        return o
+            print(result)
 
-
-class EncodingError(Exception):
-    pass
-
-
-class ValueOutOfBounds(EncodingError):
-    pass
-
-
-# Decode an unsigned/signed integer
-def decint(n, signed=False):
-    if isinstance(n, str):
-        n = utils.to_string(n)
-
-    if is_numeric(n):
-        min, max = (-TT255,TT255-1) if signed else (0,TT256-1)
-        if n > max or n < min:
-            raise EncodingError("Number out of range: %r" % n)
-        return n
-    elif is_string(n):
-        if len(n) == 40:
-            n = decode_hex(n)
-        if len(n) > 32:
-            raise EncodingError("String too long: %r" % n)
-
-        i = big_endian_to_int(n)
-        return (i - TT256) if signed and i >= TT255 else i
-    elif n is True:
-        return 1
-    elif n is False or n is None:
-        return 0
-    else:
-        raise EncodingError("Cannot encode integer: %r" % n)
-
-# Encodes a base datum
-def encode_single(typ, arg):
-    base, sub, _ = typ
-    # Unsigned integers: uint<sz>
-    if base == 'uint':
-        sub = int(sub)
-        i = decint(arg, False)
-
-        if not 0 <= i < 2**sub:
-            raise ValueOutOfBounds(repr(arg))
-        return zpad(encode_int(i), 32)
-    # bool: int<sz>
-    elif base == 'bool':
-        assert isinstance(arg, bool)
-        return zpad(encode_int(int(arg)), 32)
-    # Signed integers: int<sz>
-    elif base == 'int':
-        sub = int(sub)
-        i = decint(arg, True)
-        if not -2**(sub - 1) <= i < 2**(sub - 1):
-            raise ValueOutOfBounds(repr(arg))
-        return zpad(encode_int(i % 2**sub), 32)
-    # Unsigned reals: ureal<high>x<low>
-    elif base == 'ureal':
-        high, low = [int(x) for x in sub.split('x')]
-        if not 0 <= arg < 2**high:
-            raise ValueOutOfBounds(repr(arg))
-        return zpad(encode_int(int(arg * 2**low)), 32)
-    # Signed reals: real<high>x<low>
-    elif base == 'real':
-        high, low = [int(x) for x in sub.split('x')]
-        if not -2**(high - 1) <= arg < 2**(high - 1):
-            raise ValueOutOfBounds(repr(arg))
-        i = int(arg * 2**low)
-        return zpad(encode_int(i % 2**(high+low)), 32)
-    # Strings
-    elif base == 'string' or base == 'bytes':
-        if not is_string(arg):
-            raise EncodingError("Expecting string: %r" % arg)
-        # Fixed length: string<sz>
-        if len(sub):
-            assert int(sub) <= 32
-            assert len(arg) <= int(sub)
-            return arg + b'\x00' * (32 - len(arg))
-        # Variable length: string
-        else:
-            return zpad(encode_int(len(arg)), 32) + \
-                arg + \
-                b'\x00' * (utils.ceil32(len(arg)) - len(arg))
-    # Hashes: hash<sz>
-    elif base == 'hash':
-        if not (int(sub) and int(sub) <= 32):
-            raise EncodingError("too long: %r" % arg)
-        if is_numeric(arg):
-            return zpad(encode_int(arg), 32)
-        elif len(arg) == int(sub):
-            return zpad(arg, 32)
-        elif len(arg) == int(sub) * 2:
-            return zpad(decode_hex(arg), 32)
-        else:
-            raise EncodingError("Could not parse hash: %r" % arg)
-    # Addresses: address (== hash160)
-    elif base == 'address':
-        assert sub == ''
-        if is_numeric(arg):
-            return zpad(encode_int(arg), 32)
-        elif len(arg) == 20:
-            return zpad(arg, 32)
-        elif len(arg) == 40:
-            return zpad(decode_hex(arg), 32)
-        elif len(arg) == 42 and arg[:2] in {'0x', b'0x'}:
-            return zpad(decode_hex(arg[2:]), 32)
-        else:
-            raise EncodingError("Could not parse address: %r" % arg)
-    raise EncodingError("Unhandled type: %r %r" % (base, sub))
+        return result
 
 
 def process_type(typ):
@@ -373,8 +635,8 @@ def process_type(typ):
             "Integer size out of bounds"
         assert int(sub) % 8 == 0, \
             "Integer size must be multiple of 8"
-    # Check validity of real type
-    elif base == 'ureal' or base == 'real':
+    # Check validity of fixed type
+    elif base == 'ufixed' or base == 'fixed':
         assert re.match('^[0-9]+x[0-9]+$', sub), \
             "Real type must have suffix of form <high>x<low>, eg. 128x128"
         high, low = [int(x) for x in sub.split('x')]
@@ -407,37 +669,31 @@ def get_size(typ):
     return arrlist[-1][0] * o
 
 
-lentyp = 'uint', 256, []
-
-
 # Encodes a single value (static or dynamic)
 def enc(typ, arg):
     base, sub, arrlist = typ
-    sz = get_size(typ)
-    # Encode dynamic-sized strings as <len(str)> + <str>
+    type_size = get_size(typ)
+
     if base in ('string', 'bytes') and not sub:
-        assert isinstance(arg, (str, bytes, utils.unicode)), \
-            "Expecting a string"
-        return enc(lentyp, len(arg)) + \
-            utils.to_string(arg) + \
-            b'\x00' * (utils.ceil32(len(arg)) - len(arg))
+        return encode_single(typ, arg)
+
     # Encode dynamic-sized lists via the head/tail mechanism described in
     # https://github.com/ethereum/wiki/wiki/Proposal-for-new-ABI-value-encoding
-    elif sz is None:
+    if type_size is None:
         assert isinstance(arg, list), \
             "Expecting a list argument"
         subtyp = base, sub, arrlist[:-1]
         subsize = get_size(subtyp)
         myhead, mytail = b'', b''
         if arrlist[-1] == []:
-            myhead += enc(lentyp, len(arg))
+            myhead += enc(INT256, len(arg))
         else:
             assert len(arg) == arrlist[-1][0], \
                 "Wrong array size: found %d, expecting %d" % \
                 (len(arg), arrlist[-1][0])
         for i in range(len(arg)):
             if subsize is None:
-                myhead += enc(lentyp, 32 * len(arg) + len(mytail))
+                myhead += enc(INT256, 32 * len(arg) + len(mytail))
                 mytail += enc(subtyp, arg[i])
             else:
                 myhead += enc(subtyp, arg[i])
@@ -467,7 +723,7 @@ def encode_abi(types, args):
     myhead, mytail = b'', b''
     for i, arg in enumerate(args):
         if sizes[i] is None:
-            myhead += enc(lentyp, headsize + len(mytail))
+            myhead += enc(INT256, headsize + len(mytail))
             mytail += enc(proctypes[i], args[i])
         else:
             myhead += enc(proctypes[i], args[i])
@@ -478,9 +734,9 @@ def encode_abi(types, args):
 def decode_single(typ, data):
     base, sub, _ = typ
     if base == 'address':
-        return encode_hex(data[12:])
+        return '0x' + encode_hex(data[12:])
     elif base == 'hash':
-        return data[32-int(sub):]
+        return data[32 - int(sub):]
     elif base == 'string' or base == 'bytes':
         if len(sub):
             return data[:int(sub)]
@@ -488,20 +744,26 @@ def decode_single(typ, data):
             l = big_endian_to_int(data[0:32])
             return data[32:][:l]
     elif base == 'uint':
-        return big_endian_to_int(data)
+        return big_endian_to_int(data) % 2**int(sub)
     elif base == 'int':
-        o = big_endian_to_int(data)
-        return (o - 2**int(sub)) if o >= 2**(int(sub) - 1) else o
-    elif base == 'ureal':
+        o = big_endian_to_int(data) % 2 ** int(sub)
+        return (o - 2 ** int(sub)) if o >= 2 ** (int(sub) - 1) else o
+    elif base == 'ufixed':
         high, low = [int(x) for x in sub.split('x')]
-        return big_endian_to_int(data) * 1.0 // 2**low
-    elif base == 'real':
+        return big_endian_to_int(data) * 1.0 // 2 ** low
+    elif base == 'fixed':
         high, low = [int(x) for x in sub.split('x')]
         o = big_endian_to_int(data)
-        i = (o - 2**(high+low)) if o >= 2**(high+low-1) else o
-        return (i * 1.0 // 2**low)
+        i = (o - 2 ** (high + low)) if o >= 2 ** (high + low - 1) else o
+        return (i * 1.0 // 2 ** low)
+    elif base == 'decimal':
+        o = big_endian_to_int(data)
+        i = (o - 2 ** 256 if o > 2 ** 255 else o)
+        return i / 10 ** int(sub)
     elif base == 'bool':
         return bool(int(encode_hex(data), 16))
+    else:
+        raise EncodingError("Unhandled type: %r %r" % (base, sub))
 
 
 # Decodes multiple arguments using the head/tail mechanism
@@ -553,7 +815,7 @@ def dec(typ, arg):
     # Dynamic-sized strings are encoded as <len(str)> + <str>
     if base in ('string', 'bytes') and not sub:
         L = big_endian_to_int(arg[:32])
-        assert len(arg[32:]) == ceil32(L), "Wrong data size for string/bytes object"
+        assert len(arg[32:]) == ceil32(L), "Wrong data size for string/bytes object: expected %d actual %d" % (ceil32(L), len(arg[32:]))
         return arg[32:][:L]
     # Dynamic-sized arrays
     elif sz is None:
